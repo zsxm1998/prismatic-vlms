@@ -110,6 +110,21 @@ class LLaVa_LVIS4V_LRV_Config(DatasetConfig):
     dataset_root_dir: Path = Path("/mnt/fsx/skaramcheti/datasets/prismatic-vlms")
 
 
+# Add by zsxm
+@dataclass
+class INT_PI_PV3_2406110_Config(DatasetConfig):
+    dataset_id: str = "int_pi_pv3_2406110"
+
+    align_stage_components: Tuple[Path, Path] = (
+        Path("playground/neurips/pretrain/2404181_quilt1m_pathcapdiff_pathinstructP1.json"),
+        Path("datasets/combination/"),
+    )
+    finetune_stage_components: Tuple[Path, Path] = (
+        Path("playground/neurips/finetune/2406110_int_patho-instruct_patho-vision-3.json"),
+        Path("datasets/combination/"),
+    )
+    dataset_root_dir: Path = Path("/c22073/codes/llava-1.5/")
+
 # === Define a Dataset Registry Enum for Reference & Validation =>> all *new* datasets must be added here! ===
 @unique
 class DatasetRegistry(Enum):
@@ -122,6 +137,9 @@ class DatasetRegistry(Enum):
     LLAVA_LRV = LLaVa_LRV_Config
 
     LLAVA_LVIS4V_LRV = LLaVa_LVIS4V_LRV_Config
+
+    # add by zsxm
+    INT_PI_PV3_2406110 = INT_PI_PV3_2406110_Config
 
     @property
     def dataset_id(self) -> str:

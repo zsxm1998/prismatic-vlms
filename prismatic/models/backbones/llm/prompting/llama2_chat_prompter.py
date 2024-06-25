@@ -22,7 +22,7 @@ SYS_PROMPTS = {
 
 
 def format_system_prompt(system_prompt: str) -> str:
-    return f"<<SYS>\n{system_prompt.strip()}\n<</SYS>>\n\n"
+    return f"<<SYS>>\n{system_prompt.strip()}\n<</SYS>>\n\n"
 
 
 class LLaMa2ChatPromptBuilder(PromptBuilder):

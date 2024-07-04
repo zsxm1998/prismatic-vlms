@@ -21,9 +21,10 @@ from transformers import CodeGenTokenizerFast, LlamaTokenizerFast, PreTrainedTok
 
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
+from prismatic.util.bbox_ops import extract_and_replace_bboxes
 
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
-IGNORE_INDEX = -100
+from prismatic.constants import IGNORE_INDEX, DEFAULT_BBOX_TOKEN
 
 
 class AlignDataset(Dataset[Dict[str, torch.Tensor]]):
@@ -33,14 +34,19 @@ class AlignDataset(Dataset[Dict[str, torch.Tensor]]):
         image_dir: Path,
         image_transform: ImageTransform,
         tokenizer: PreTrainedTokenizerBase,
+        model_family: str = 'prismatic',
     ) -> None:
         super().__init__()
         self.chat_json, self.image_dir = chat_json, image_dir
         self.image_transform, self.tokenizer = image_transform, tokenizer
         self.dataset_type = "align"
+        self.model_family = model_family
 
         # Create Prompt Template
-        self.prompt_template = "{caption}" + self.tokenizer.eos_token
+        if self.model_family in ['OmniPath']:
+            self.prompt_template = "<image> {caption}" + self.tokenizer.eos_token
+        else:
+            self.prompt_template = "{caption}" + self.tokenizer.eos_token
 
         # Load Chat JSON
         with open(self.chat_json, "r") as f:
@@ -70,6 +76,9 @@ class AlignDataset(Dataset[Dict[str, torch.Tensor]]):
 
         # Format Caption --> {caption}{eos_token}
         caption = self.prompt_template.format(caption=conversation[-1]["value"].strip())
+        if self.model_family in ['OmniPath']:
+            caption, bboxes = extract_and_replace_bboxes(caption)
+            bboxes=torch.tensor(bboxes)
 
         # We treat image patches as "tokens = [p1 p2 p3, ...]"; we need to specify ordering of text/patch tokens.
         #   => Critically, we find that inserting *after* the BOS token leads to the strongest performance!
@@ -81,11 +90,14 @@ class AlignDataset(Dataset[Dict[str, torch.Tensor]]):
         labels = copy.deepcopy(input_ids)
 
         # Set the <BOS> token's label to IGNORE_INDEX (since we're inserting the image patches right after)
+        # NOTE by ZSXM: labels[0] will be shift out when calculating loss, so it doesn't matter whether to set it
         labels[0] = IGNORE_INDEX
 
         # Process Image --> get "pixel_values" (will either be a torch.Tensor OR a Dict[str,torch.Tensor])
         pixel_values = self.image_transform(Image.open(self.image_dir / image_path).convert("RGB"))
 
+        if self.model_family in ['OmniPath']:
+            return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, bboxes=bboxes)
         return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
 
     def get_modality_lengths(self, n_image_patches: int) -> List[Tuple[bool, int]]:
@@ -93,7 +105,10 @@ class AlignDataset(Dataset[Dict[str, torch.Tensor]]):
         modality_lengths = []
         for example in self.examples:
             is_multimodal = "image" in example
-            n_words = sum([len(turn["value"].replace("<image>", "").split()) for turn in example["conversations"]])
+            if self.model_family in ['OmniPath']:
+                n_words = sum([len(turn["value"].split()) for turn in example["conversations"]])
+            else:
+                n_words = sum([len(turn["value"].replace("<image>", "").split()) for turn in example["conversations"]])
             modality_lengths.append((is_multimodal, (n_image_patches + n_words) if is_multimodal else n_words))
         return modality_lengths
 
@@ -109,12 +124,14 @@ class FinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
         image_transform: ImageTransform,
         tokenizer: PreTrainedTokenizerBase,
         prompt_builder_fn: Type[PromptBuilder],
+        model_family: str = 'prismatic',
     ) -> None:
         super().__init__()
         self.instruct_json, self.image_dir = instruct_json, image_dir
         self.image_transform, self.tokenizer = image_transform, tokenizer
         self.prompt_builder_fn = prompt_builder_fn
         self.dataset_type = "finetune"
+        self.model_family = model_family
 
         # Load Instruct JSON
         with open(self.instruct_json, "r") as f:
@@ -136,7 +153,8 @@ class FinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
         conversation = self.examples[idx]["conversations"]
 
         # Create Prompt Builder --> add each message sequentially
-        prompt_builder, input_ids, labels = self.prompt_builder_fn(model_family="prismatic"), [], []
+        prompt_builder, input_ids, labels = self.prompt_builder_fn(model_family=self.model_family), [], []
+        bbox_list = []
         for turn_idx, turn in enumerate(conversation):
             # Get "effective" string added to prompt --> handle whitespace for tokenizer type!
             msg = prompt_builder.add_turn(turn["from"], turn["value"])
@@ -151,6 +169,10 @@ class FinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
 
             else:
                 raise ValueError(f"Tokenizer of type `{type(self.tokenizer)}` is not explicitly handled!")
+            
+            if self.model_family in ['OmniPath']:
+                msg, bboxes = extract_and_replace_bboxes(msg)
+                bbox_list.extend(bboxes)
 
             # Tokenize Input IDs
             turn_input_ids = self.tokenizer(msg, add_special_tokens=turn_idx == 0).input_ids
@@ -172,20 +194,25 @@ class FinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
         input_ids, labels = input_ids[: self.tokenizer.model_max_length], labels[: self.tokenizer.model_max_length]
 
         # === Handle "unimodal" (language-only) vs. "multimodal" ===
+        pixel_values = None # No image --> return `pixel_values` = None; Collator will do the smart batch handling for us!
         if "image" in self.examples[idx]:
             image_path = Path(self.examples[idx]["image"])
 
             # Set the <BOS> token's label to IGNORE_INDEX (since we're inserting the image patches right after)
+            # NOTE by ZSXM: labels[0] will be shift out when calculating loss, so it doesn't matter whether to set it
             labels[0] = IGNORE_INDEX
 
             # Process Image --> get "pixel_values" (will either be a torch.Tensor OR a Dict[str,torch.Tensor])
             pixel_values = self.image_transform(Image.open(self.image_dir / image_path).convert("RGB"))
-
-            return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
-
-        else:
-            # No image --> return `pixel_values` = None; Collator will do the smart batch handling for us!
-            return dict(pixel_values=None, input_ids=input_ids, labels=labels)
+        
+        if self.model_family in ['OmniPath']:
+            if len(bbox_list) > 0:
+                bbox_id = self.tokenizer.convert_tokens_to_ids(DEFAULT_BBOX_TOKEN)
+                assert bbox_id != self.tokenizer.unk_token_id
+                assert torch.isin(input_ids, torch.tensor(bbox_id, dtype=input_ids.dtype)).any()
+            bboxes = torch.tensor(bbox_list)
+            return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, bboxes=bboxes)
+        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
 
     def get_modality_lengths(self) -> List[Tuple[bool, int]]:
         """Get a list of modalities (unimodal / text-only vs. multimodal) and length of conversations per example."""

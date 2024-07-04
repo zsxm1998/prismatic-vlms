@@ -1,5 +1,5 @@
 """
-nn_utils.py
+origin file is prismatic.util.nn_utils.py
 
 Utility functions and PyTorch submodule definitions.
 """

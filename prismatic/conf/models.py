@@ -70,6 +70,9 @@ class ModelConfig(ChoiceRegistry):
     enable_mixed_precision_training: bool = True            # Whether to enable mixed precision training
     reduce_in_full_precision: bool = False                  # Whether to run gradient reduction in FP32
 
+    # Add model_family for judge which type of VLM to train by ZSXM
+    model_family: str = 'prismatic'
+
     # fmt: on
 
 
@@ -489,6 +492,18 @@ class Prism_7B_DINOSigLIP_224px(Exp_7B_One_Stage):
     finetune_epochs: int = 2
 
 
+# Go into OmniPath
+@dataclass
+class OmniPath_Vicuna_13B_DINOSigLIP(LLaVa_v15_Reproduction_13B):
+    model_id: str = "omni-dinosiglip-384px-vicuna+13b"
+    model_family: str = 'OmniPath'
+    vision_backbone_id: str = "dinosiglip-vit-so-384px"
+    image_resize_strategy: str = "letterbox"
+    arch_specifier: str = "fused-gelu-mlp"
+    align_epochs: int = 1
+    finetune_epochs: int = 2
+
+
 # === Define a Model Registry Enum for Reference & Validation ===
 @unique
 class ModelRegistry(Enum):
@@ -565,6 +580,9 @@ class ModelRegistry(Enum):
     # === Inference Optimized :: 224px Prism Models ===
     PRISM_DINOSIGLIP_224PX_CONTROLLED_7B = Prism_7B_DINOSigLIP_224px_Controlled
     PRISM_DINOSIGLIP_224PX_7B = Prism_7B_DINOSigLIP_224px
+
+    # === OmniPath Models added by ZSXM ===
+    OMNI_VICUNA_13B_DINOSIGLIP = OmniPath_Vicuna_13B_DINOSigLIP
 
     @property
     def model_id(self) -> str:

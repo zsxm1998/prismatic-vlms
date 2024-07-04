@@ -20,7 +20,7 @@ from prismatic.models.backbones.vision import (
     SigLIPViTBackbone,
     VisionBackbone,
 )
-from prismatic.models.vlms import PrismaticVLM
+from prismatic.models.vlms import VLM, PrismaticVLM, OmniPathVLM
 
 # === Registries =>> Maps ID --> {cls(), kwargs} :: Different Registries for Vision Backbones, LLM Backbones, VLMs ===
 # fmt: off
@@ -115,16 +115,28 @@ def get_llm_backbone_and_tokenizer(
 
 def get_vlm(
     model_id: str,
+    model_family: str, 
     arch_specifier: str,
     vision_backbone: VisionBackbone,
     llm_backbone: LLMBackbone,
     enable_mixed_precision_training: bool = True,
-) -> PrismaticVLM:
+) -> VLM:
     """Lightweight wrapper around initializing a VLM, mostly for future-proofing (if one wants to add a new VLM)."""
-    return PrismaticVLM(
-        model_id,
-        vision_backbone,
-        llm_backbone,
-        enable_mixed_precision_training=enable_mixed_precision_training,
-        arch_specifier=arch_specifier,
-    )
+    if model_family == 'prismatic':
+        return PrismaticVLM(
+            model_id,
+            vision_backbone,
+            llm_backbone,
+            enable_mixed_precision_training=enable_mixed_precision_training,
+            arch_specifier=arch_specifier,
+        )
+    elif model_family == 'OmniPath':
+        return OmniPathVLM(
+            model_id,
+            vision_backbone,
+            llm_backbone,
+            enable_mixed_precision_training=enable_mixed_precision_training,
+            arch_specifier=arch_specifier,
+        )
+    else:
+        raise ValueError(f'{model_family = } is a wrong value.')

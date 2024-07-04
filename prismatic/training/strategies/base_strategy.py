@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from prismatic.models.vlms import PrismaticVLM
+from prismatic.models.vlms import VLM
 from prismatic.overwatch import initialize_overwatch
 from prismatic.training.metrics import Metrics
 from prismatic.util import check_bloat16_supported
@@ -33,7 +33,7 @@ overwatch = initialize_overwatch(__name__)
 class TrainingStrategy(ABC):
     def __init__(
         self,
-        vlm: PrismaticVLM,
+        vlm: VLM,
         device_id: int,
         epochs: int,
         max_steps: Optional[int],
@@ -179,13 +179,25 @@ class TrainingStrategy(ABC):
                         dtype=self.mixed_precision_dtype,
                         enabled=self.enable_mixed_precision_training,
                     ):
-                        output: CausalLMOutputWithPast = self.vlm(
-                            input_ids=batch["input_ids"],
-                            attention_mask=batch["attention_mask"],
-                            pixel_values=batch["pixel_values"],
-                            labels=batch["labels"],
-                            multimodal_indices=batch["multimodal_indices"],
-                        )
+                        if self.vlm.model_family in ['OmniPath']:
+                            output: CausalLMOutputWithPast = self.vlm(
+                                input_ids=batch["input_ids"],
+                                attention_mask=batch["attention_mask"],
+                                pixel_values=batch["pixel_values"],
+                                labels=batch["labels"],
+                                multimodal_indices=batch["multimodal_indices"],
+                                bboxes=batch["bboxes"],
+                                return_dict=True,
+                            )
+                        else:
+                            output: CausalLMOutputWithPast = self.vlm(
+                                input_ids=batch["input_ids"],
+                                attention_mask=batch["attention_mask"],
+                                pixel_values=batch["pixel_values"],
+                                labels=batch["labels"],
+                                multimodal_indices=batch["multimodal_indices"],
+                                return_dict=True,
+                            )
                         loss = output.loss
 
                     # Commit Loss (Prior to Gradient Accumulation Normalization)

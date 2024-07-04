@@ -11,7 +11,7 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
-IGNORE_INDEX = -100
+from prismatic.constants import IGNORE_INDEX
 
 
 @dataclass
@@ -20,6 +20,7 @@ class PaddedCollatorForLanguageModeling:
     pad_token_id: int
     default_image_resolution: Tuple[int, int, int]
     padding_side: str = "right"
+    model_family: str = "prismatic"
     pixel_values_dtype: torch.dtype = torch.float32
 
     def __post_init__(self) -> None:
@@ -28,6 +29,8 @@ class PaddedCollatorForLanguageModeling:
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         pixel_values = [instance["pixel_values"] for instance in instances]
+        if self.model_family in ['OmniPath']:
+            bboxes = [instance["bboxes"] for instance in instances]
 
         # For now, we only support Tokenizers with `padding_side = "right"` during Training (but plan to extend!)
         #   => Handle padding via RNN Utils => `pad_sequence`
@@ -69,6 +72,16 @@ class PaddedCollatorForLanguageModeling:
             }
         else:
             raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
+        
+        if self.model_family in ['OmniPath']:
+            return dict(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                multimodal_indices=multimodal_indices,
+                bboxes=bboxes
+            )
 
         return dict(
             pixel_values=pixel_values,

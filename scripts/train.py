@@ -1,5 +1,5 @@
 """
-pretrain.py
+train.py
 
 Pretraining script for Prismatic VLM pretraining in native PyTorch, using Fully-Sharded Data Parallel (FSDP) to run
 distributed training across GPUs. By default, assumes that CUDA toolkit is >= 11.0 (to support BF16 mixed precision).
@@ -125,6 +125,7 @@ def pretrain(cfg: PretrainConfig) -> None:
 
     # Create Unique Run Name & Save Directory
     model_id = cfg.model.model_id
+    model_family = cfg.model.model_family #getattr(cfg.model, 'model_family', 'prismatic')
     if (dataset_id := cfg.dataset.dataset_id) == "llava-v15":
         cfg.run_id = f"{model_id}+stage-{cfg.stage}+x{cfg.seed}" if cfg.run_id is None else cfg.run_id
     else:
@@ -156,9 +157,10 @@ def pretrain(cfg: PretrainConfig) -> None:
     )
 
     # Create VLM => wraps `vision_backbone` and `llm`
-    overwatch.info(f"Instantiating PrismaticVLM `{model_id}` for Training Stage = `{cfg.stage}`")
+    overwatch.info(f"Instantiating VLM `{model_id = }` of `{model_family = }` for Training Stage = `{cfg.stage}`")
     vlm = get_vlm(
         model_id,
+        model_family,
         cfg.model.arch_specifier,
         vision_backbone,
         llm_backbone,
@@ -183,6 +185,7 @@ def pretrain(cfg: PretrainConfig) -> None:
         prompt_builder_fn=llm_backbone.prompt_builder_fn,
         default_image_resolution=vision_backbone.default_image_resolution,
         padding_side=tokenizer.padding_side,
+        model_family=model_family,
     )
 
     # Create Train Strategy

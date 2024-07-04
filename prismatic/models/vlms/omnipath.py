@@ -1,7 +1,7 @@
 """
-prismatic.py
+omnipath.py
 
-PyTorch Module defining a PrismaticVLM, our general interface for defining the various different VLMs in our work.
+PyTorch Module defining a OmniPathVLM, our general interface for defining the various different VLMs that supports predicting bboxes and masks.
 
 Notes:
     - For now, we don't subclass `transformers.PretrainedModel` (or CausalLM). Instead, we assume a very limited subset
@@ -13,30 +13,32 @@ from __future__ import annotations
 
 from functools import partial
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Type, Union
+from typing import Callable, Dict, List, Optional, Type, Union, Any
 
 import torch
 from PIL import Image
+import torch.nn.functional as F
 from torch.distributed.fsdp.wrap import _module_wrap_policy, _or_policy
-from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_outputs import ModelOutput, CausalLMOutputWithPast
 
 from prismatic.models.backbones.llm import LLMBackbone
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import VisionBackbone
 from prismatic.models.projectors import FusedMLPProjector, LinearProjector, MLPProjector
 from prismatic.models.vlms.base_vlm import VLM
+from prismatic.models.backbones.accessory import BBoxEncoder, BBoxDecoder
 from prismatic.overwatch import initialize_overwatch
-
+from prismatic.util.bbox_ops import generalized_box_iou
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
 
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
-from prismatic.constants import IGNORE_INDEX
+from prismatic.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_BBOX_TOKEN, DEFAULT_MASK_TOKEN
 
 
-class PrismaticVLM(VLM):
+class OmniPathVLM(VLM):
     def __init__(
         self,
         model_id: str,
@@ -46,15 +48,12 @@ class PrismaticVLM(VLM):
         arch_specifier: str = "gelu-mlp",
     ) -> None:
         super().__init__(
-            "prismatic",
+            "OmniPath",
             model_id,
             vision_backbone,
             llm_backbone,
             enable_mixed_precision_training=enable_mixed_precision_training,
         )
-
-        # Set Weight Initialization Seed for Projector Consistency
-        torch.manual_seed(vision_backbone.embed_dim)
 
         # Initialize Projection (Adapter) based on `arch_specifier`
         self.arch_specifier = arch_specifier
@@ -65,13 +64,17 @@ class PrismaticVLM(VLM):
         elif arch_specifier.endswith("gelu-mlp"):
             self.projector = MLPProjector(vision_backbone.embed_dim, llm_backbone.embed_dim)
         else:
-            raise ValueError(f"PrismaticVLM with `{arch_specifier = }` is not supported!")
+            raise ValueError(f"OmniPathVLM with `{arch_specifier = }` is not supported!")
+        
+        # Accessories for bbox and mask prediction
+        self.bbox_encoder = BBoxEncoder(llm_backbone.embed_dim)
+        self.bbox_decoder = BBoxDecoder(llm_backbone.embed_dim)
 
         # Trackers
         self.vision_backbone_requires_grad = False
 
         # Set Module Keys =>> used in Checkpoint Saving / Model Loading
-        self.all_module_keys = ["vision_backbone", "llm_backbone", "projector"]
+        self.all_module_keys = ["vision_backbone", "llm_backbone", "projector", "bbox_encoder", "bbox_decoder"]
         self.trainable_module_keys = []
 
         # === Generation Utilities ===
@@ -82,6 +85,14 @@ class PrismaticVLM(VLM):
             assert len(token_idx_list) == 1, f'String "{trigger_string}" is tokenized as more than one token!'
             self.string2idx[trigger_string] = token_idx_list[0]
 
+        # Add tokens for data processing
+        tokenizer = self.llm_backbone.get_tokenizer()
+        tokenizer.add_tokens([DEFAULT_IMAGE_TOKEN, DEFAULT_BBOX_TOKEN])
+        self.llm_backbone.llm.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
+        self.config.image_id, self.config.bbox_id = tokenizer.convert_tokens_to_ids([DEFAULT_IMAGE_TOKEN, DEFAULT_BBOX_TOKEN])
+        self.llm_backbone.llm.get_input_embeddings().weight.data[self.config.image_id] = self.config.image_id
+        self.llm_backbone.llm.get_input_embeddings().weight.data[self.config.bbox_id] = self.config.bbox_id
+
     @classmethod
     def from_pretrained(
         cls,
@@ -91,8 +102,8 @@ class PrismaticVLM(VLM):
         llm_backbone: LLMBackbone,
         enable_mixed_precision_training: bool = True,
         arch_specifier: str = "gelu-mlp",
-    ) -> PrismaticVLM:
-        """Initialize a PrismaticVLM from a pretrained checkpoint, freezing all weights, tailored for inference."""
+    ) -> OmniPathVLM:
+        """Initialize a OmniPathVLM from a pretrained checkpoint, freezing all weights, tailored for inference."""
         vlm = cls(
             model_id,
             vision_backbone,
@@ -101,14 +112,18 @@ class PrismaticVLM(VLM):
             arch_specifier=arch_specifier,
         )
 
-        # Load from Checkpoint (Custom --> should load both *projector* and *llm* weights)
+        # Load from Checkpoint (Custom --> should load *projector*, *bbox_encoder*, and *bbox_decoder*  weights)
         model_state_dict = torch.load(pretrained_checkpoint, map_location="cpu")["model"]
-        assert (
-            "projector" in model_state_dict and "llm_backbone" in model_state_dict
-        ), "PrismaticVLM `from_pretrained` expects checkpoint with keys for `projector` AND `llm_backbone`!"
 
         vlm.projector.load_state_dict(model_state_dict["projector"])
-        vlm.llm_backbone.load_state_dict(model_state_dict["llm_backbone"])
+        if "bbox_encoder" in model_state_dict:
+            vlm.bbox_encoder.load_state_dict(model_state_dict["bbox_encoder"])
+        if "bbox_decoder" in model_state_dict:
+            vlm.bbox_decoder.load_state_dict(model_state_dict["bbox_decoder"])
+        if "llm_backbone" in model_state_dict:
+            vlm.llm_backbone.load_state_dict(model_state_dict["llm_backbone"])
+        if "vision_backbone" in model_state_dict:
+            vlm.vision_backbone.load_state_dict(model_state_dict["vision_backbone"])
 
         # Freeze Weights
         vlm.requires_grad_(False)
@@ -124,19 +139,23 @@ class PrismaticVLM(VLM):
         """
         This function sets `requires_grad_` on each of the component modules explicitly, depending on stage.
 
-        We support two separate stages --> "align" and "finetune".
+        We support four separate stages --> "align", "finetune", "vision-finetune" and "full-finetune".
             => "align" --> vision_backbone*, llm_backbone* are frozen; only the `projector` is trained.
             => "finetune" --> vision_backbone* is frozen; both `projector` and `llm_backbone` are trained.
+            => "vision-finetune" --> llm_backbone* is frozen; both `vision_backbone` and `projector` are trained.
+            => "full-finetune" --> `vision_backbone`, `projector` and `llm_backbone` are trained.
 
-        :param stage: Pretraining stage in < "align" | "finetune" | "full-finetune" >
+        :param stage: Pretraining stage in < "align" | "finetune" | "vision-finetune" | "full-finetune" >
         """
         if stage == "align":
             self.vision_backbone.requires_grad_(False)
             self.llm_backbone.requires_grad_(False)
             self.projector.requires_grad_(True)
+            self.bbox_encoder.requires_grad_(True)
+            self.bbox_decoder.requires_grad_(True)
 
             # Add to `self.trainable_module_keys`
-            self.trainable_module_keys = ["projector"]
+            self.trainable_module_keys = ["projector", "bbox_encoder", "bbox_decoder"]
 
             # Update Trackers
             self.vision_backbone_requires_grad = False
@@ -145,14 +164,18 @@ class PrismaticVLM(VLM):
             overwatch.info(f"[Frozen]    🥶 =>> Vision Backbone `{self.vision_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[Frozen]    🥶 =>> LLM Backbone `{self.llm_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> Projector `{self.arch_specifier}`", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxEncoder", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxDecoder", ctx_level=1)
 
         elif stage == "finetune":
             self.vision_backbone.requires_grad_(False)
             self.llm_backbone.requires_grad_(True)
             self.projector.requires_grad_(True)
+            self.bbox_encoder.requires_grad_(True)
+            self.bbox_decoder.requires_grad_(True)
 
             # Add to `self.trainable_module_keys`
-            self.trainable_module_keys = ["projector", "llm_backbone"]
+            self.trainable_module_keys = ["projector", "llm_backbone", "bbox_encoder", "bbox_decoder"]
 
             # Update Trackers
             self.vision_backbone_requires_grad = False
@@ -161,15 +184,39 @@ class PrismaticVLM(VLM):
             overwatch.info(f"[Frozen]    🥶 =>> Vision Backbone `{self.vision_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> LLM Backbone `{self.llm_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> Projector `{self.arch_specifier}`", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxEncoder", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxDecoder", ctx_level=1)
+
+        elif stage == "vision-finetune":
+            self.vision_backbone.requires_grad_(True)
+            self.llm_backbone.requires_grad_(False)
+            self.projector.requires_grad_(True)
+            self.bbox_encoder.requires_grad_(True)
+            self.bbox_decoder.requires_grad_(True)
+
+            # Add to `self.trainable_module_keys`
+            self.trainable_module_keys = ["vision_backbone", "projector", "bbox_encoder", "bbox_decoder"]
+
+            # Update Trackers
+            self.vision_backbone_requires_grad = True
+
+            # Explicitly Log Frozen / Unfrozen Components
+            overwatch.info(f"[TRAINABLE] 🔥 =>> Vision Backbone `{self.vision_backbone.identifier}`", ctx_level=1)
+            overwatch.info(f"[Frozen]    🥶 =>> LLM Backbone `{self.llm_backbone.identifier}`", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> Projector `{self.arch_specifier}`", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxEncoder", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxDecoder", ctx_level=1)
 
         elif stage == "full-finetune":
-            self.vision_backbone.dtype = torch.float32
+            # self.vision_backbone.dtype = torch.float32 # comment out by ZSXM: I don't know why to set this.
             self.vision_backbone.requires_grad_(True)
             self.llm_backbone.requires_grad_(True)
             self.projector.requires_grad_(True)
+            self.bbox_encoder.requires_grad_(True)
+            self.bbox_decoder.requires_grad_(True)
 
             # Add to `self.trainable_module_keys`
-            self.trainable_module_keys = ["vision_backbone", "projector", "llm_backbone"]
+            self.trainable_module_keys = ["vision_backbone", "projector", "llm_backbone", "bbox_encoder", "bbox_decoder"]
 
             # Update Trackers
             self.vision_backbone_requires_grad = True
@@ -178,18 +225,20 @@ class PrismaticVLM(VLM):
             overwatch.info(f"[TRAINABLE] 🔥 =>> Vision Backbone `{self.vision_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> LLM Backbone `{self.llm_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> Projector `{self.arch_specifier}`", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxEncoder", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxDecoder", ctx_level=1)
 
         else:
             raise ValueError(f"Stage `{stage}` is not supported for LLaVa! Try < align | finetune >")
 
     def load_from_checkpoint(self, stage: str, run_dir: Path, pretrained_checkpoint: Optional[Path] = None) -> None:
         """Load weights from checkpoint (if required by the given stage)."""
-        assert stage in {"align", "finetune", "full-finetune"}, f"Stage {stage} is not supported!"
+        assert stage in {"align", "finetune", "vision-finetune", "full-finetune"}, f"Stage {stage} is not supported!"
 
         # If we're running a `no-align` architecture, we're good!
-        if self.arch_specifier.startswith("no-align"):
+        if self.arch_specifier.startswith("no-align") and pretrained_checkpoint is None:
             overwatch.info(
-                f"PrismaticVLM with `{self.arch_specifier = }` does not require pretrained weights!", ctx_level=1
+                f"OmniPathVLM with `{self.arch_specifier = }` does not require pretrained weights!", ctx_level=1
             )
             return
 
@@ -206,11 +255,24 @@ class PrismaticVLM(VLM):
             overwatch.info(f"Loading from Provided Checkpoint `{pretrained_checkpoint}`", ctx_level=1)
             model_state_dict = torch.load(pretrained_checkpoint)["model"]
             self.projector.load_state_dict(model_state_dict["projector"])
+            if "llm_backbone" in model_state_dict:
+                self.llm_backbone.load_state_dict(model_state_dict["llm_backbone"])
+            if "vision_backbone" in model_state_dict:
+                self.vision_backbone.load_state_dict(model_state_dict["vision_backbone"])
+            if "bbox_encoder" in model_state_dict:
+                self.bbox_encoder.load_state_dict(model_state_dict["bbox_encoder"])
+            if "bbox_decoder" in model_state_dict:
+                self.bbox_decoder.load_state_dict(model_state_dict["bbox_decoder"])
 
             return
 
         # [Contract] If no `pretrained_checkpoint`, assume `align` lives in the run directory; string substitution!
-        model, scale, _, seed = run_dir.name.split("+")
+        ctt = run_dir.name.split("+")
+        if len(ctt) == 4:
+            model, scale, _, seed = run_dir.name.split("+")
+        else:
+            dataset_id, model, scale, _, seed = run_dir.name.split("+")
+            model = f"{dataset_id}+{model}"
         align_dirs = [
             d
             for d in run_dir.parent.iterdir()
@@ -221,6 +283,14 @@ class PrismaticVLM(VLM):
             overwatch.info(f"Loading from Discovered Checkpoint `{pretrained_checkpoint}`", ctx_level=1)
             model_state_dict = torch.load(pretrained_checkpoint)["model"]
             self.projector.load_state_dict(model_state_dict["projector"])
+            if "llm_backbone" in model_state_dict:
+                self.llm_backbone.load_state_dict(model_state_dict["llm_backbone"])
+            if "vision_backbone" in model_state_dict:
+                self.vision_backbone.load_state_dict(model_state_dict["vision_backbone"])
+            if "bbox_encoder" in model_state_dict:
+                self.bbox_encoder.load_state_dict(model_state_dict["bbox_encoder"])
+            if "bbox_decoder" in model_state_dict:
+                self.bbox_decoder.load_state_dict(model_state_dict["bbox_decoder"])
         else:
             raise ValueError(f"Could not find valid `align` checkpoint at {pretrained_checkpoint}!")
 
@@ -232,7 +302,7 @@ class PrismaticVLM(VLM):
         # Get Prismatic Wrapping Policy =>> just a module wrapping policy around `self.projector`
         prismatic_fsdp_wrapping_policy = partial(
             _module_wrap_policy,
-            module_classes={LinearProjector, MLPProjector, FusedMLPProjector},
+            module_classes={LinearProjector, MLPProjector, FusedMLPProjector, BBoxEncoder, BBoxDecoder},
         )
 
         # Return union (_or_) over constituent policies
@@ -255,7 +325,7 @@ class PrismaticVLM(VLM):
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[Union[torch.FloatTensor, List[torch.FloatTensor]]] = None,
         labels: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -264,41 +334,69 @@ class PrismaticVLM(VLM):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         multimodal_indices: Optional[torch.LongTensor] = None,
+        bboxes: Optional[List[torch.FloatTensor]] = None,
+        previous_last_hidden_states: Optional[torch.FloatTensor] = None,
     ) -> CausalLMOutputWithPast:
         """Run a forward pass through the VLM, returning a CausalLMOutputWithPast instance (contains loss)."""
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if inputs_embeds is None:
+            inputs_embeds = self.llm_backbone.embed_input_ids(input_ids)
 
         # Handle Inference (leverage cache, short-circuit on just LLM forward)
         if input_ids.shape[1] == 1 and past_key_values is not None:
             # We're leveraging the cache, so just redirect to `self.llm_backbone` with `input_ids` and `past_key_values`
+            replace_indices = torch.isin(input_ids, torch.tensor([self.config.bbox_id])).flatten()
+            if replace_indices.sum() > 0: # replace the embeddings of <bbox> and <mask> to previous generated output embeddings
+                inputs_embeds[replace_indices, -1] = previous_last_hidden_states[replace_indices, -1]
             output = self.llm_backbone(
-                input_ids=input_ids,
+                input_ids=None,
                 attention_mask=None,
                 position_ids=None,
                 past_key_values=past_key_values,
-                inputs_embeds=None,
+                inputs_embeds=inputs_embeds,
                 labels=None,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
+                output_hidden_states=True,
                 return_dict=return_dict,
             )
             return output
 
         elif input_ids.shape[1] == 1 or pixel_values is None:
             raise RuntimeError("Invalid `forward()` call!")
+        
+        # Encode bboxes
+        bbox_numbers = (input_ids == self.config.bbox_id).sum(1)
+        bbox_valid_flag = bboxes is not None and any(b.shape[0]>0 for b in bboxes)
+        if bbox_valid_flag or bbox_numbers.sum() > 0:
+            assert all([len(b) == bbox_numbers[i] for i, b in enumerate(bboxes)]), f'{[(len(b), bbox_numbers[i]) for i, b in enumerate(bboxes)]}'
+            bboxes = torch.cat(bboxes, 0)
+            bbox_embeds = self.bbox_encoder(bboxes)
+            inputs_embeds[input_ids == self.config.bbox_id] = bbox_embeds
+        else:
+            bboxes = torch.rand(1, 4).round(decimals=3)
+            bboxes = bboxes.view(1,2,2).sort()[0].view(1, 4).to(inputs_embeds)
+            bbox_embeds = self.bbox_encoder(bboxes)
 
-        # Handle Multimodal Indices is None --> pretend like the batch is fully multimodal (always image + text)!
-        if multimodal_indices is None:
-            multimodal_indices = torch.arange(len(input_ids), dtype=torch.long, device=input_ids.device)
+        # For images
+        image_numbers = (input_ids == self.config.image_id).sum(1)
+        multimodal_indices_now = (image_numbers>0).nonzero().flatten()
+        if multimodal_indices is not None:
+            assert torch.equal(multimodal_indices, multimodal_indices_now), f'{multimodal_indices=}, {multimodal_indices_now=}'
+        multimodal_indices = multimodal_indices_now
 
         # Handle Multimodal Indices is Empty (len == 0) --> simple unimodal forward
-        elif len(multimodal_indices) == 0:
+        if len(multimodal_indices) == 0:
+            # Assume that no bboxes in pure text 
+            assert bbox_numbers.sum() == 0
             return self.llm_backbone(
-                input_ids=input_ids,
+                input_ids=None,
                 attention_mask=attention_mask,
                 position_ids=None,
                 past_key_values=past_key_values,
-                inputs_embeds=None,
+                inputs_embeds=inputs_embeds,
                 labels=labels,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
@@ -307,6 +405,7 @@ class PrismaticVLM(VLM):
             )
 
         # Run Visual Feature Extraction
+        # TODO: add support for multiple images
         with torch.set_grad_enabled(self.vision_backbone_requires_grad):
             if isinstance(pixel_values, dict):
                 patch_features = self.vision_backbone({k: pixel_values[k][multimodal_indices] for k in pixel_values})
@@ -315,54 +414,47 @@ class PrismaticVLM(VLM):
 
         # Projection Logic :: [bsz, num_patches, llm_embed_dim] =>> num_patches = (2 *) (256 + 1) for ViT-L + CLS
         projected_patch_embeddings = self.projector(patch_features)
-        projected_patch_attention_mask = None
-        if attention_mask is not None:
-            projected_patch_attention_mask = torch.full(
-                (projected_patch_embeddings.shape[0], projected_patch_embeddings.shape[1]),
-                True,
-                dtype=attention_mask.dtype,
-                device=attention_mask.device,
-            )
 
-        # Get Input Embeddings from LLM Backbone :: [bsz, input_seq_len, llm_embed_dim]
-        input_embeddings = self.llm_backbone.embed_input_ids(input_ids)
+        # Build Multimodal Embeddings, attention_mask and labels
+        # TODO: add support for multiple images
+        multimodal_embeddings = []
+        multimodal_attention_mask = None if attention_mask is None else []
+        multimodal_labels = None if labels is None else []
+        cur_image_idx = 0
+        for bidx, cur_input_ids in zip(multimodal_indices, input_ids[multimodal_indices]):
+            cur_img_locs = [-1]+torch.where(cur_input_ids == self.config.image_id)[0].tolist()+[cur_input_ids.shape[0]]
+            cur_inputs_embeds = inputs_embeds[bidx]
+            cur_new_inputs_embeds = []
+            if attention_mask is not None:
+                cur_new_attention_mask = []
+            if labels is not None:
+                cur_new_labels = []
+            
+            for s, e in zip(cur_img_locs[:-1], cur_img_locs[1:]):
+                cur_new_inputs_embeds.append(cur_inputs_embeds[s+1:e])
+                if attention_mask is not None:
+                    cur_new_attention_mask.append(attention_mask[bidx, s+1:e])
+                if labels is not None:
+                    cur_new_labels.append(labels[bidx, s+1:e])
 
-        # Build Multimodal Embeddings (and build resulting attention mask)
-        multimodal_embeddings = torch.cat(
-            [
-                input_embeddings[multimodal_indices, :1, :],
-                projected_patch_embeddings,
-                input_embeddings[multimodal_indices, 1:, :],
-            ],
-            dim=1,
-        )
-        multimodal_attention_mask = None
-        if attention_mask is not None:
-            multimodal_attention_mask = torch.cat(
-                [
-                    attention_mask[multimodal_indices, :1],
-                    projected_patch_attention_mask,
-                    attention_mask[multimodal_indices, 1:],
-                ],
-                dim=1,
-            )
-
-        # [Contract] We assume the first token of `labels` (associated with <BOS>) is already marked as "IGNORE"
-        #   => We'll ignore the per-token outputs for each of the patch embeddings as well!
-        multimodal_labels = None
-        if labels is not None:
-            projected_patch_labels = torch.full(
-                (projected_patch_embeddings.shape[0], projected_patch_embeddings.shape[1]),
-                IGNORE_INDEX,
-                dtype=labels.dtype,
-                device=labels.device,
-            )
-            multimodal_labels = torch.cat(
-                [labels[multimodal_indices, :1], projected_patch_labels, labels[multimodal_indices, 1:]], dim=1
-            )
+                if e != cur_input_ids.shape[0]:
+                    cur_new_inputs_embeds.append(projected_patch_embeddings[cur_image_idx])
+                    if attention_mask is not None:
+                        cur_new_attention_mask.append(torch.full((projected_patch_embeddings.shape[1],),
+                                                                 True, dtype=attention_mask.dtype, device=attention_mask.device))
+                    if labels is not None:
+                        cur_new_labels.append(torch.full((projected_patch_embeddings.shape[1],),
+                                                         IGNORE_INDEX, dtype=labels.dtype, device=labels.device))
+                    cur_image_idx += 1
+            
+            multimodal_embeddings.append(torch.cat(cur_new_inputs_embeds, dim=0))
+            if attention_mask is not None:
+                multimodal_attention_mask.append(torch.cat(cur_new_attention_mask, dim=0))
+            if labels is not None:
+                multimodal_labels.append(torch.cat(cur_new_labels, dim=0))
+        assert cur_image_idx == projected_patch_embeddings.shape[0], f'{cur_image_idx}, {projected_patch_embeddings.shape[0]}'
 
         # === Add Unimodal Handling ===
-
         # Create Fused Embeddings, Attention Mask, and Labels by Merging with "unimodal" Inputs (if applicable)
         unimodal_indices = torch.tensor(
             [idx for idx in range(len(input_ids)) if idx not in multimodal_indices],
@@ -375,52 +467,128 @@ class PrismaticVLM(VLM):
             fused_embeddings = multimodal_embeddings
             fused_attention_mask = multimodal_attention_mask
             fused_labels = multimodal_labels
-
         else:
             # Otherwise --> Merge w/ unimodal data
+            fused_embeddings = multimodal_embeddings + list(inputs_embeds[unimodal_indices])
+            fused_attention_mask = multimodal_attention_mask + list(attention_mask[unimodal_indices]) if attention_mask is not None else None
+            fused_labels = multimodal_labels + list(labels[unimodal_indices]) if labels is not None else None
 
-            # This doesn't matter --> but in the "normal" case this is the embedding of the <PAD> token
-            #   => NOTE :: Verified that `zeros/randn/empty/<PAD> embedding` all return the same result!
-            unimodal_embeddings_pad = torch.zeros(
-                (len(unimodal_indices), projected_patch_embeddings.shape[1], input_embeddings.shape[2]),
-                dtype=input_embeddings.dtype,
-                device=input_embeddings.device,
-            )
-            unimodal_attention_pad = torch.full(
-                (len(unimodal_indices), projected_patch_embeddings.shape[1]),
-                False,
-                dtype=attention_mask.dtype,
-                device=attention_mask.device,
-            )
-            unimodal_labels_pad = torch.full(
-                (len(unimodal_indices), projected_patch_embeddings.shape[1]),
-                IGNORE_INDEX,
-                dtype=labels.dtype,
-                device=labels.device,
-            )
+        # Truncate and concatenate inputs_embeds and so on
+        max_len = min(max(e.shape[0] for e in fused_embeddings), self.llm_backbone.get_tokenizer().model_max_length)
+        final_inputs_embeds, final_attention_mask, final_labels = [], [], []
+        for i, cur_inputs_embeds in enumerate(fused_embeddings):
+            if self.llm_backbone.get_tokenizer().padding_side == 'right':
+                if fused_attention_mask is not None:
+                    assert fused_attention_mask[i].shape[0] == cur_inputs_embeds.shape[0]
+                    cur_attention_mask = fused_attention_mask[i][:max_len]
+                    cur_attention_mask = torch.cat([cur_attention_mask,
+                                                    torch.full((max_len-cur_attention_mask.shape[0],),
+                                                               False,
+                                                               dtype=attention_mask.dtype,
+                                                               device=attention_mask.device)])
+                    final_attention_mask.append(cur_attention_mask)
+                if fused_labels is not None:
+                    assert fused_labels[i].shape[0] == cur_inputs_embeds.shape[0]
+                    cur_labels = fused_labels[i][:max_len]
+                    cur_labels = torch.cat([cur_labels,
+                                            torch.full((max_len-cur_labels.shape[0],),
+                                                       IGNORE_INDEX,
+                                                       dtype=labels.dtype,
+                                                       device=labels.device)])
+                    final_labels.append(cur_labels)
+                cur_inputs_embeds = cur_inputs_embeds[:max_len]
+                # This doesn't matter --> but in the "normal" case this is the embedding of the <PAD> token
+                #   => NOTE :: Verified that `zeros/randn/empty/<PAD> embedding` all return the same result!
+                cur_inputs_embeds = torch.cat([cur_inputs_embeds,
+                                               torch.zeros(max_len-cur_inputs_embeds.shape[0],
+                                                           cur_inputs_embeds.shape[1],
+                                                           dtype=inputs_embeds.dtype,
+                                                           device=inputs_embeds.device)])
+                final_inputs_embeds.append(cur_inputs_embeds)
+            else:
+                if fused_attention_mask is not None:
+                    assert fused_attention_mask[i].shape[0] == cur_inputs_embeds.shape[0]
+                    cur_attention_mask = fused_attention_mask[i][-max_len:]
+                    cur_attention_mask = torch.cat([torch.full((max_len-cur_attention_mask.shape[0],),
+                                                               False,
+                                                               dtype=attention_mask.dtype,
+                                                               device=attention_mask.device),
+                                                    cur_attention_mask])
+                    final_attention_mask.append(cur_attention_mask)
+                if fused_labels is not None:
+                    assert fused_labels[i].shape[0] == cur_inputs_embeds.shape[0]
+                    cur_labels = fused_labels[i][-max_len:]
+                    cur_labels = torch.cat([torch.full((max_len-cur_labels.shape[0],),
+                                                       IGNORE_INDEX,
+                                                       dtype=labels.dtype,
+                                                       device=labels.device),
+                                            cur_labels])
+                    final_labels.append(cur_labels)
+                cur_inputs_embeds = cur_inputs_embeds[-max_len:]
+                cur_inputs_embeds = torch.cat([torch.zeros(max_len-cur_inputs_embeds.shape[0],
+                                                           cur_inputs_embeds.shape[1],
+                                                           dtype=inputs_embeds.dtype,
+                                                           device=inputs_embeds.device),
+                                               cur_inputs_embeds,])
+                final_inputs_embeds.append(cur_inputs_embeds)
 
-            unimodal_embeddings = torch.cat([input_embeddings[unimodal_indices], unimodal_embeddings_pad], dim=1)
-            unimodal_attention_mask = torch.cat([attention_mask[unimodal_indices], unimodal_attention_pad], dim=1)
-            unimodal_labels = torch.cat([labels[unimodal_indices], unimodal_labels_pad], dim=1)
-
-            # Create "Fused" Tensors by Stacking Multimodal & Unimodal
-            fused_embeddings = torch.vstack([multimodal_embeddings, unimodal_embeddings])
-            fused_attention_mask = torch.vstack([multimodal_attention_mask, unimodal_attention_mask])
-            fused_labels = torch.vstack([multimodal_labels, unimodal_labels])
+        inputs_embeds = torch.stack(final_inputs_embeds, dim=0)
+        attention_mask = torch.stack(final_attention_mask, dim=0) if attention_mask is not None else None
+        labels = torch.stack(final_labels, dim=0) if labels is not None else None
 
         # Run LLM Forward --> returns CausalLMOutputWithPast!
-        return self.llm_backbone(
+        outputs = self.llm_backbone(
             input_ids=None,
-            attention_mask=fused_attention_mask,
+            attention_mask=attention_mask,
             position_ids=None,
             past_key_values=past_key_values,
-            inputs_embeds=fused_embeddings,
-            labels=fused_labels,
+            inputs_embeds=inputs_embeds,
+            labels=labels,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            output_hidden_states=True,
+            return_dict=True,
         )
+
+        # Calculate losses
+        loss = outputs.loss
+        if labels is not None:
+            # TODO: Currently, the scenario where human input includes bboxes has not been considered.
+            shift_labels = labels[:, 1:].contiguous()
+            shift_last_hidden_states = outputs.hidden_states[-1][:, :-1]
+            bbox_hs = shift_last_hidden_states[shift_labels == self.config.bbox_id]
+            bbox_preds = self.bbox_decoder(bbox_hs if bbox_valid_flag else bbox_embeds)
+            loss += self.bbox_loss(bbox_preds, bboxes)
+
+            # cycle loss bbox->embed->bbox
+            loss += 0.5 * self.bbox_loss(self.bbox_decoder(bbox_embeds), bboxes)
+
+            # cycle loss embed->bbox->embed
+            # 这里将bbox_hs detach是因为LLM生成的向量由于经过大量预训练，因此质量更高
+            # 需要将没有预训练的bbox_encoder生成的向量向其靠拢，而不是反过来
+            # 如果反过来，则会导致LLM生成的向量被没有预训练的bbox_encoder扰乱，导致预测下一个词受到影响
+            loss += 0.5 * F.mse_loss(bbox_embeds, bbox_hs.detach() if bbox_valid_flag else bbox_embeds.detach())
+
+        if not return_dict:
+            output = outputs[1:] if outputs.loss is not None else outputs[:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=outputs.logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    def bbox_loss(self, b_pred, b_true):
+        loss_f1 = F.l1_loss(b_pred, b_true)
+        valid_mask = (b_pred[:, 2:] >= b_pred[:, :2]).all(-1)
+        if valid_mask.sum() == 0:
+            return loss_f1*2
+        b_pred, b_true = b_pred[valid_mask], b_true[valid_mask]
+        loss_giou = (1-torch.diag(generalized_box_iou(b_pred, b_true))).mean()
+        return loss_f1*2 + loss_giou/5
 
     # === GenerationMixin Methods ===
     #   => Note: The following methods override the functionality of `transformers.GenerationMixin`; these expect the
@@ -435,7 +603,7 @@ class PrismaticVLM(VLM):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         use_cache: Optional[bool] = None,
-        **kwargs: torch.Tensor,
+        **kwargs: Dict[str, Any],
     ) -> Dict[str, torch.Tensor]:
         """Borrowed from `LlamaForCausalLM` --> in general, just handles caching logic during generation."""
         if past_key_values:
@@ -454,10 +622,25 @@ class PrismaticVLM(VLM):
                 "pixel_values": pixel_values,
                 "past_key_values": past_key_values,
                 "use_cache": use_cache,
+                "bboxes": kwargs.get('bboxes', None), 
+                "previous_last_hidden_states": kwargs.get('previous_last_hidden_states', None), 
             }
         )
 
         return model_inputs
+    
+    def _update_model_kwargs_for_generation(
+        self,
+        outputs: ModelOutput,
+        model_kwargs: Dict[str, Any],
+        is_encoder_decoder: bool = False,
+        standardize_cache_format: bool = False,
+    ) -> Dict[str, Any]:
+        """Function that is used after forward in generate to process model inputs for next step forward."""
+        model_kwargs = super(OmniPathVLM, self)._update_model_kwargs_for_generation(outputs, model_kwargs, is_encoder_decoder, standardize_cache_format)
+        model_kwargs['previous_last_hidden_states'] = outputs.hidden_states[-1].detach().clone()
+
+        return model_kwargs
 
     @torch.inference_mode()
     def generate_batch(
@@ -475,9 +658,9 @@ class PrismaticVLM(VLM):
             tokenizer(text, truncation=True, return_tensors="pt").input_ids.to(self.device) for text in texts
         ]
         if isinstance(pixel_values, torch.Tensor):
-            pixel_values = pixel_values[None, ...].to(self.device)
+            batch_pixel_values = pixel_values[:, None, ...].to(self.device)
         elif isinstance(pixel_values, dict):
-            pixel_values = {k: v[None, ...].to(self.device) for k, v in pixel_values.items()}
+            batch_pixel_values = {k: v[:, None, ...].to(self.device) for k, v in pixel_values.items()}
         else:
             raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
 
@@ -489,9 +672,9 @@ class PrismaticVLM(VLM):
         with torch.autocast("cuda", dtype=autocast_dtype, enabled=self.enable_mixed_precision_training):
             for idx, input_ids in enumerate(batch_input_ids):
                 if isinstance(pixel_values, torch.Tensor):
-                    pixel_values = pixel_values[idx]
+                    pixel_values = batch_pixel_values[idx]
                 elif isinstance(pixel_values, dict):
-                    pixel_values = {k: pixel_values[k][idx] for k in pixel_values}
+                    pixel_values = {k: batch_pixel_values[k][idx] for k in batch_pixel_values}
                 else:
                     raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
 

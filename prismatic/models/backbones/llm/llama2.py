@@ -48,6 +48,11 @@ LLAMA2_MODELS = {
     "vicuna-v15-13b": {
         "llm_family": "llama2", "llm_cls": LlamaForCausalLM, "hf_hub_path": "lmsys/vicuna-13b-v1.5"
     },
+
+    # === Add by ZSXM for local LLM ===
+    "vicuna-v15-13b-local": {
+        "llm_family": "llama2", "llm_cls": LlamaForCausalLM, "hf_hub_path": "/c22073/LLM_weights/vicuna-13b-v1.5"
+    },
 }
 # fmt: on
 

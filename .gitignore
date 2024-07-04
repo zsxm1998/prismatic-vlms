@@ -148,3 +148,7 @@ dmypy.json
 cache/
 data/
 runs/
+
+# weight files
+*.pt
+*.pth

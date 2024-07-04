@@ -16,6 +16,9 @@ SYS_PROMPTS = {
         "A chat between a curious user and an artificial intelligence assistant. "
         "The assistant gives helpful, detailed, and polite answers to the user's questions."
     ),
+    "OmniPath": (
+        "You are a large language and vision assistant trained by the VIPA lab, based on the LLaVA architecture. You are able to understand the visual content that the user provides. You are specifically designed to provide professional responses to pathology images and are capable of detecting and segmenting specified pathology concepts. Here is a chat between a curious USER and you. Follow the instructions carefully and explain your answers in detail."
+    ),
 }
 
 
@@ -36,7 +39,10 @@ class VicunaV15ChatPromptBuilder(PromptBuilder):
 
     def add_turn(self, role: str, message: str) -> str:
         assert (role == "human") if (self.turn_count % 2 == 0) else (role == "gpt")
-        message = message.replace("<image>", "").strip()
+        if self.model_family in ['OmniPath']:
+            message = message.strip()
+        else:
+            message = message.replace("<image>", "").strip()
 
         # Special Handling for "system" prompt (turn_count == 0)
         if self.turn_count == 0:

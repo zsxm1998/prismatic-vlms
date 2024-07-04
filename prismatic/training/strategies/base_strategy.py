@@ -161,6 +161,7 @@ class TrainingStrategy(ABC):
             ),
             desc=status,
             leave=False,
+            dynamic_ncols=True,
             disable=not overwatch.is_rank_zero(),
         ) as progress:
             for epoch in range(self.epochs):

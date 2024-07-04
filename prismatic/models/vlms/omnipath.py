@@ -376,8 +376,12 @@ class OmniPathVLM(VLM):
             bbox_embeds = self.bbox_encoder(bboxes)
             inputs_embeds[input_ids == self.config.bbox_id] = bbox_embeds
         else:
-            bboxes = torch.rand(1, 4).round(decimals=3)
-            bboxes = bboxes.view(1,2,2).sort()[0].view(1, 4).to(inputs_embeds)
+            bboxes = torch.rand(1, 4).round(decimals=3).view(1,2,2).sort(dim=1)[0]
+            ct = (bboxes[:, 0] + bboxes[:, 1]) / 2
+            wh = (bboxes[:, 1] - bboxes[:, 0]) / (overwatch.rank() + 1 if overwatch.rank() >= 0 else 1)
+            bboxes[:, 0, :] = ct - wh / 2
+            bboxes[:, 1, :] = ct + wh / 2
+            bboxes = bboxes.view(-1, 4).to(inputs_embeds)
             bbox_embeds = self.bbox_encoder(bboxes)
 
         # For images

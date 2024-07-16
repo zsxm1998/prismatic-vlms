@@ -28,7 +28,7 @@ from prismatic.models.projectors import FusedMLPProjector, LinearProjector, MLPP
 from prismatic.models.vlms.base_vlm import VLM
 from prismatic.models.backbones.accessory import BBoxEncoder, BBoxDecoder
 from prismatic.overwatch import initialize_overwatch
-from prismatic.util.bbox_ops import generalized_box_iou
+from prismatic.util.bbox_ops import generalized_box_iou, restore_bboxes
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -347,7 +347,7 @@ class OmniPathVLM(VLM):
         # Handle Inference (leverage cache, short-circuit on just LLM forward)
         if input_ids.shape[1] == 1 and past_key_values is not None:
             # We're leveraging the cache, so just redirect to `self.llm_backbone` with `input_ids` and `past_key_values`
-            replace_indices = torch.isin(input_ids, torch.tensor([self.config.bbox_id])).flatten()
+            replace_indices = torch.isin(input_ids, torch.tensor([self.config.bbox_id]).to(input_ids)).flatten()
             if replace_indices.sum() > 0: # replace the embeddings of <bbox> and <mask> to previous generated output embeddings
                 inputs_embeds[replace_indices, -1] = previous_last_hidden_states[replace_indices, -1]
             output = self.llm_backbone(
@@ -738,13 +738,22 @@ class OmniPathVLM(VLM):
         autocast_dtype = self.llm_backbone.half_precision_dtype
         with torch.autocast("cuda", dtype=autocast_dtype, enabled=self.enable_mixed_precision_training):
             # fmt: off
-            generated_ids = super().generate(
+            outputs = super().generate(
                 input_ids=input_ids,            # Shape: [1, seq]
                 pixel_values=pixel_values,      # Shape: [1, 3, res, res] or Dict[str, Shape[1, 3, res, res]]
+                return_dict_in_generate=True,
+                output_hidden_states=True,
                 **kwargs
             )
             # fmt: on
-
-        generated_text = tokenizer.decode(generated_ids[0, input_ids.shape[1] :], skip_special_tokens=True).strip()
+        
+        # restore bounding box
+        generated_ids = outputs.sequences[0, input_ids.shape[1] :]
+        generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        replace_indices = torch.isin(generated_ids, torch.tensor([self.config.bbox_id]).to(generated_ids))
+        if replace_indices.sum() > 0:
+            last_hidden_states = torch.cat([token_hs[-1][0, -1:] for token_hs in outputs.hidden_states], dim=0)
+            bbox_preds = self.bbox_decoder(last_hidden_states[replace_indices])
+            generated_text = restore_bboxes(generated_text, bbox_preds)
 
         return generated_text

@@ -152,3 +152,7 @@ runs/
 # weight files
 *.pt
 *.pth
+
+# dataset
+playground*/*
+output

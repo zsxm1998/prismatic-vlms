@@ -89,6 +89,7 @@ def masks_to_boxes(masks):
 
     return torch.stack([x_min, y_min, x_max, y_max], 1)
 
+
 def extract_and_replace_bboxes(input_str, bbox_tag="bbox", replace_with=DEFAULT_BBOX_TOKEN):
     # 定义正则表达式，匹配指定标签的bounding box
     pattern = re.compile(rf"<{bbox_tag}>(.*?)</{bbox_tag}>")
@@ -103,3 +104,20 @@ def extract_and_replace_bboxes(input_str, bbox_tag="bbox", replace_with=DEFAULT_
     output_str = pattern.sub(replace_with, input_str)
     
     return output_str, bboxes
+
+
+def restore_bboxes(output_str, bboxes, bbox_tag="bbox", replace_with=DEFAULT_BBOX_TOKEN):
+    # 将tensor转换为字符串列表
+    bbox_strs = [", ".join(map(lambda x: f"{x:.3f}", bbox.tolist())) for bbox in bboxes]
+    # 用于替换的正则表达式
+    pattern = re.compile(re.escape(replace_with))
+    # 用于查找的位置指针
+    pos = 0
+    # 逐个替换占位符为bounding box字符串，从左到右
+    for bbox_str in bbox_strs:
+        match = pattern.search(output_str, pos)
+        if match:
+            start, end = match.span()
+            output_str = output_str[:start] + f"<{bbox_tag}>{bbox_str}</{bbox_tag}>" + output_str[end:]
+            pos = start + len(f"<{bbox_tag}>{bbox_str}</{bbox_tag}>")  # 更新查找位置
+    return output_str

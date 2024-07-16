@@ -14,7 +14,7 @@ from huggingface_hub import hf_hub_download
 
 from prismatic.models.materialize import get_llm_backbone_and_tokenizer, get_vision_backbone_and_transform
 from prismatic.models.registry import GLOBAL_REGISTRY, MODEL_REGISTRY
-from prismatic.models.vlms import PrismaticVLM
+from prismatic.models.vlms import VLM, PrismaticVLM, OmniPathVLM
 from prismatic.overwatch import initialize_overwatch
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
@@ -47,8 +47,8 @@ def get_model_description(model_id_or_name: str) -> str:
 # === Load Pretrained Model ===
 def load(
     model_id_or_path: Union[str, Path], hf_token: Optional[str] = None, cache_dir: Optional[Union[str, Path]] = None
-) -> PrismaticVLM:
-    """Loads a pretrained PrismaticVLM from either local disk or the HuggingFace Hub."""
+) -> VLM:
+    """Loads a pretrained VLM from either local disk or the HuggingFace Hub."""
     if os.path.isdir(model_id_or_path):
         overwatch.info(f"Loading from local path `{(run_dir := Path(model_id_or_path))}`")
 
@@ -98,12 +98,23 @@ def load(
 
     # Load VLM using `from_pretrained` (clobbers HF syntax... eventually should reconcile)
     overwatch.info(f"Loading VLM [bold blue]{model_cfg['model_id']}[/] from Checkpoint; Freezing Weights 🥶")
-    vlm = PrismaticVLM.from_pretrained(
-        checkpoint_pt,
-        model_cfg["model_id"],
-        vision_backbone,
-        llm_backbone,
-        arch_specifier=model_cfg["arch_specifier"],
-    )
-
+    if model_cfg['model_family'] == 'prismatic':
+        vlm = PrismaticVLM.from_pretrained(
+            checkpoint_pt,
+            model_cfg["model_id"],
+            vision_backbone,
+            llm_backbone,
+            arch_specifier=model_cfg["arch_specifier"],
+        )
+    elif model_cfg['model_family'] == 'OmniPath':
+        vlm = OmniPathVLM.from_pretrained(
+            checkpoint_pt,
+            model_cfg["model_id"],
+            vision_backbone,
+            llm_backbone,
+            arch_specifier=model_cfg["arch_specifier"],
+        )
+    else:
+        raise ValueError(f"{model_cfg['model_family'] = } is a wrong value.")
+    
     return vlm

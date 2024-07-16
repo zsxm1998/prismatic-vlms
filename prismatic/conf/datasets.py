@@ -139,6 +139,20 @@ class PI_PV3_2406231_Config(DatasetConfig):
     )
     dataset_root_dir: Path = Path("/c22073/codes/llava-1.5/")
 
+@dataclass
+class PI_PV3_2407091_Config(DatasetConfig):
+    dataset_id: str = "pi_pv3_2407091"
+
+    align_stage_components: Tuple[Path, Path] = (
+        Path("playground/neurips/pretrain/2404181_quilt1m_pathcapdiff_pathinstructP1.json"),
+        Path("datasets/combination/"),
+    )
+    finetune_stage_components: Tuple[Path, Path] = (
+        Path("playground/neurips/finetune/2407091_patho-instruct_patho-vision-3.json"),
+        Path("datasets/combination/"),
+    )
+    dataset_root_dir: Path = Path("/c22073/codes/llava-1.5/")
+
 # === Define a Dataset Registry Enum for Reference & Validation =>> all *new* datasets must be added here! ===
 @unique
 class DatasetRegistry(Enum):
@@ -155,6 +169,7 @@ class DatasetRegistry(Enum):
     # Add by ZSXM
     INT_PI_PV3_2406110 = INT_PI_PV3_2406110_Config
     PI_PV3_2406231 = PI_PV3_2406231_Config
+    PI_PV3_2407091 = PI_PV3_2407091_Config
 
     @property
     def dataset_id(self) -> str:

@@ -2,8 +2,8 @@
 torchrun --standalone --nnodes 1 --nproc-per-node 8 scripts/train.py \
   --model.type "omni-dinosiglip-384px-vicuna+13b" \
   --model.llm_max_length 8192 \
-  --model.finetune_per_device_batch_size 8 \
-  --dataset.type pi_pv3_2406231 \
+  --model.finetune_per_device_batch_size 4 \
+  --dataset.type pi_pv3_2407091 \
   --stage full-finetune \
   --pretrained_checkpoint /c22073/LLM_weights/prism-dinosiglip+13b/checkpoints/latest-checkpoint.pt
 

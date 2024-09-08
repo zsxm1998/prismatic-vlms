@@ -492,6 +492,18 @@ class Prism_7B_DINOSigLIP_224px(Exp_7B_One_Stage):
     finetune_epochs: int = 2
 
 
+# Add by ZSXM
+@dataclass
+class Vicuna_13B_DINOSigLIP(LLaVa_v15_Reproduction_13B):
+    model_id: str = "dinosiglip-384px-letterbox-vicuna+13b"
+    model_family: str = 'prismatic'
+    vision_backbone_id: str = "dinosiglip-vit-so-384px"
+    image_resize_strategy: str = "letterbox"
+    arch_specifier: str = "fused-gelu-mlp"
+    align_epochs: int = 1
+    finetune_epochs: int = 2
+
+
 # Go into OmniPath
 @dataclass
 class OmniPath_Vicuna_13B_DINOSigLIP(LLaVa_v15_Reproduction_13B):
@@ -580,6 +592,9 @@ class ModelRegistry(Enum):
     # === Inference Optimized :: 224px Prism Models ===
     PRISM_DINOSIGLIP_224PX_CONTROLLED_7B = Prism_7B_DINOSigLIP_224px_Controlled
     PRISM_DINOSIGLIP_224PX_7B = Prism_7B_DINOSigLIP_224px
+
+    # === Models added by ZSXM ===
+    VICUNA_13B_DINOSIGLIP = Vicuna_13B_DINOSigLIP
 
     # === OmniPath Models added by ZSXM ===
     OMNI_VICUNA_13B_DINOSIGLIP = OmniPath_Vicuna_13B_DINOSigLIP

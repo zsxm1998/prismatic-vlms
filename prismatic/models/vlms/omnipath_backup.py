@@ -35,7 +35,7 @@ overwatch = initialize_overwatch(__name__)
 
 
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
-from prismatic.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_BBOX_TOKEN, DEFAULT_BBOX_END_TOKEN, DEFAULT_MASK_TOKEN
+from prismatic.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_BBOX_TOKEN, DEFAULT_MASK_TOKEN
 
 
 class OmniPathVLM(VLM):
@@ -87,14 +87,11 @@ class OmniPathVLM(VLM):
 
         # Add tokens for data processing
         tokenizer = self.llm_backbone.get_tokenizer()
-        bbox_embed = self.llm_backbone.llm.get_input_embeddings().weight.data[tokenizer(DEFAULT_BBOX_TOKEN, add_special_tokens=False).input_ids].mean(0)
-        tokenizer.add_tokens([DEFAULT_IMAGE_TOKEN, DEFAULT_BBOX_TOKEN, DEFAULT_BBOX_END_TOKEN])
+        tokenizer.add_tokens([DEFAULT_IMAGE_TOKEN, DEFAULT_BBOX_TOKEN])
         self.llm_backbone.llm.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)
-        self.config.image_id, self.config.bbox_id, self.config.bbox_end_id = tokenizer.convert_tokens_to_ids([DEFAULT_IMAGE_TOKEN, DEFAULT_BBOX_TOKEN, DEFAULT_BBOX_END_TOKEN])
-        input_embeddings = self.llm_backbone.llm.get_input_embeddings().weight.data
-        input_embeddings[self.config.image_id] = self.config.image_id
-        input_embeddings[self.config.bbox_id] = bbox_embed
-        input_embeddings[self.config.bbox_end_id] = self.config.bbox_end_id
+        self.config.image_id, self.config.bbox_id = tokenizer.convert_tokens_to_ids([DEFAULT_IMAGE_TOKEN, DEFAULT_BBOX_TOKEN])
+        self.llm_backbone.llm.get_input_embeddings().weight.data[self.config.image_id] = self.config.image_id
+        self.llm_backbone.llm.get_input_embeddings().weight.data[self.config.bbox_id] = self.config.bbox_id
 
     @classmethod
     def from_pretrained(
@@ -339,7 +336,6 @@ class OmniPathVLM(VLM):
         multimodal_indices: Optional[torch.LongTensor] = None,
         bboxes: Optional[List[torch.FloatTensor]] = None,
         previous_last_hidden_states: Optional[torch.FloatTensor] = None,
-        replace_indices: Optional[torch.BoolTensor] = None,
     ) -> CausalLMOutputWithPast:
         """Run a forward pass through the VLM, returning a CausalLMOutputWithPast instance (contains loss)."""
 
@@ -351,7 +347,8 @@ class OmniPathVLM(VLM):
         # Handle Inference (leverage cache, short-circuit on just LLM forward)
         if input_ids.shape[1] == 1 and past_key_values is not None:
             # We're leveraging the cache, so just redirect to `self.llm_backbone` with `input_ids` and `past_key_values`
-            if replace_indices is not None and replace_indices.sum() > 0: # replace the embeddings of <bbox> and <mask> to previous generated output embeddings
+            replace_indices = torch.isin(input_ids, torch.tensor([self.config.bbox_id]).to(input_ids)).flatten()
+            if replace_indices.sum() > 0: # replace the embeddings of <bbox> and <mask> to previous generated output embeddings
                 inputs_embeds[replace_indices, -1] = self.bbox_encoder(self.bbox_decoder(previous_last_hidden_states[replace_indices, -1]))
             output = self.llm_backbone(
                 input_ids=None,
@@ -365,22 +362,19 @@ class OmniPathVLM(VLM):
                 output_hidden_states=True,
                 return_dict=return_dict,
             )
-            replace_indices = torch.isin(input_ids, torch.tensor([self.config.bbox_id]).to(input_ids)).flatten()
-            if replace_indices.sum() > 0:
-                output.logits[replace_indices, -1] = F.one_hot(torch.tensor(self.config.bbox_end_id), output.logits.shape[-1]).to(output.logits) * 30.0
             return output
 
         elif input_ids.shape[1] == 1 or pixel_values is None:
             raise RuntimeError("Invalid `forward()` call!")
         
         # Encode bboxes
-        bbox_numbers = (input_ids == self.config.bbox_end_id).sum(1)
+        bbox_numbers = (input_ids == self.config.bbox_id).sum(1)
         bbox_valid_flag = bboxes is not None and any(b.shape[0]>0 for b in bboxes)
         if bbox_valid_flag or bbox_numbers.sum() > 0:
             assert all([len(b) == bbox_numbers[i] for i, b in enumerate(bboxes)]), f'{[(len(b), bbox_numbers[i]) for i, b in enumerate(bboxes)]}'
             bboxes = torch.cat(bboxes, 0)
             bbox_embeds = self.bbox_encoder(bboxes)
-            inputs_embeds[input_ids == self.config.bbox_end_id] = bbox_embeds
+            inputs_embeds[input_ids == self.config.bbox_id] = bbox_embeds
         else:
             bboxes = torch.rand(1, 4).round(decimals=3).view(1,2,2).sort(dim=1)[0]
             ct = (bboxes[:, 0] + bboxes[:, 1]) / 2
@@ -545,10 +539,6 @@ class OmniPathVLM(VLM):
         inputs_embeds = torch.stack(final_inputs_embeds, dim=0)
         attention_mask = torch.stack(final_attention_mask, dim=0) if attention_mask is not None else None
         labels = torch.stack(final_labels, dim=0) if labels is not None else None
-        # origin_labels = labels.clone() if labels is not None else None
-        # if labels is not None:
-        #     labels[labels == self.config.bbox_end_id] = IGNORE_INDEX
-        origin_labels = labels # 8.7测试对</bbox>进行token loss计算的结果
 
         # Run LLM Forward --> returns CausalLMOutputWithPast!
         outputs = self.llm_backbone(
@@ -568,11 +558,10 @@ class OmniPathVLM(VLM):
         loss = outputs.loss
         if labels is not None:
             # TODO: Currently, the scenario where human input includes bboxes has not been considered.
-            shift_origin_labels = origin_labels[:, 1:].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
             shift_last_hidden_states = outputs.hidden_states[-1][:, :-1]
-            bbox_hs = shift_last_hidden_states[shift_origin_labels == self.config.bbox_end_id]
+            bbox_hs = shift_last_hidden_states[shift_labels == self.config.bbox_id]
             bbox_preds = self.bbox_decoder(bbox_hs if bbox_valid_flag else bbox_embeds)
-            #loss += self.bbox_loss(bbox_preds, bboxes) * (1 if bbox_valid_flag else 0)
             loss += self.bbox_loss(bbox_preds, bboxes)
 
             # cycle loss bbox->embed->bbox
@@ -654,7 +643,6 @@ class OmniPathVLM(VLM):
         """Function that is used after forward in generate to process model inputs for next step forward."""
         model_kwargs = super(OmniPathVLM, self)._update_model_kwargs_for_generation(outputs, model_kwargs, is_encoder_decoder, standardize_cache_format)
         model_kwargs['previous_last_hidden_states'] = outputs.hidden_states[-1].detach().clone()
-        model_kwargs['replace_indices'] = torch.isin(outputs.logits[:,-1].argmax(dim=-1), torch.tensor([self.config.bbox_end_id]).to(device=outputs.logits.device))
 
         return model_kwargs
 
@@ -762,7 +750,7 @@ class OmniPathVLM(VLM):
         # restore bounding box
         generated_ids = outputs.sequences[0, input_ids.shape[1] :]
         generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-        replace_indices = torch.isin(generated_ids, torch.tensor([self.config.bbox_end_id]).to(generated_ids))
+        replace_indices = torch.isin(generated_ids, torch.tensor([self.config.bbox_id]).to(generated_ids))
         if replace_indices.sum() > 0:
             last_hidden_states = torch.cat([token_hs[-1][0, -1:] for token_hs in outputs.hidden_states], dim=0)
             bbox_preds = self.bbox_decoder(last_hidden_states[replace_indices])

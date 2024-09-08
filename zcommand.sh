@@ -3,9 +3,21 @@ torchrun --standalone --nnodes 1 --nproc-per-node 8 scripts/train.py \
   --model.type "omni-dinosiglip-384px-vicuna+13b" \
   --model.llm_max_length 8192 \
   --model.finetune_per_device_batch_size 4 \
-  --dataset.type pi_pv3_2407091 \
+  --dataset.type pi_pv3_2408051 \
   --stage full-finetune \
+  --seed 807 \
   --pretrained_checkpoint /c22073/LLM_weights/prism-dinosiglip+13b/checkpoints/latest-checkpoint.pt
+
+# torchrun --standalone --nnodes 1 --nproc-per-node 8 scripts/train.py \
+#   --model.type dinosiglip-384px-letterbox-vicuna+13b \
+#   --model.llm_max_length 8192 \
+#   --model.finetune_per_device_batch_size 4 \
+#   --dataset.type pi_pv3_2407091 \
+#   --stage full-finetune \
+#   --seed 7 \
+#   --pretrained_checkpoint /c22073/LLM_weights/prism-dinosiglip+13b/checkpoints/latest-checkpoint.pt
+
+
 
 # for file in /c22073/LLM_weights/vicuna-13b-v1.5/*; do
 #     ln -s "$file" "/c22073/local/.cache/huggingface/hub/models--lmsys--vicuna-13b-v1.5/snapshots/c8327bf999adbd2efe2e75f6509fa01436100dc2/$(basename "$file")"

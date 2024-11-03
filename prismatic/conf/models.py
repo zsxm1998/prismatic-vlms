@@ -516,6 +516,17 @@ class OmniPath_Vicuna_13B_DINOSigLIP(LLaVa_v15_Reproduction_13B):
     finetune_epochs: int = 2
 
 
+@dataclass
+class OmniPath_Vicuna_13B_UNISigLIP(LLaVa_v15_Reproduction_13B):
+    model_id: str = "omni-unisiglip-384px-vicuna+13b"
+    model_family: str = 'OmniPath'
+    vision_backbone_id: str = "unisiglip-vit-so-384px"
+    image_resize_strategy: str = "letterbox"
+    arch_specifier: str = "fused-gelu-mlp"
+    align_epochs: int = 1
+    finetune_epochs: int = 2
+
+
 # === Define a Model Registry Enum for Reference & Validation ===
 @unique
 class ModelRegistry(Enum):
@@ -598,6 +609,7 @@ class ModelRegistry(Enum):
 
     # === OmniPath Models added by ZSXM ===
     OMNI_VICUNA_13B_DINOSIGLIP = OmniPath_Vicuna_13B_DINOSigLIP
+    OMNI_VICUNA_13B_UNISIGLIP = OmniPath_Vicuna_13B_UNISigLIP
 
     @property
     def model_id(self) -> str:

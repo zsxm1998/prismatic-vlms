@@ -13,9 +13,9 @@ RES_FILE="./playground/omnipath/eval/$CKPT_NAME/1_liverWSI.log"
 mkdir -p ./playground/omnipath/eval/$CKPT_NAME
 
 if [[ $CKPT_DIR == *"int"* ]]; then
-  QUESTION_FILE="/c22073/datasets/liverWSI/patch_bbox_contour_336_14/int_question_edge01_val.jsonl"
+  QUESTION_FILE="/c22073/datasets/liverWSI/origin_patch_bbox_contour_336_14/int_question_edge01_val.jsonl"
 else
-  QUESTION_FILE="/c22073/datasets/liverWSI/patch_bbox_contour_336_14/question_edge01_val.jsonl"
+  QUESTION_FILE="/c22073/datasets/liverWSI/origin_patch_bbox_contour_336_14/question_edge01_val.jsonl"
 fi
 
 ANSWER_FILE="./playground/omnipath/eval/$CKPT_NAME/liverWSI_edge01.jsonl"

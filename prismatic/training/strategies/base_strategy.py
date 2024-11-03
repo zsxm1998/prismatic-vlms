@@ -188,6 +188,7 @@ class TrainingStrategy(ABC):
                                 labels=batch["labels"],
                                 multimodal_indices=batch["multimodal_indices"],
                                 bboxes=batch["bboxes"],
+                                masks=batch["masks"],
                                 return_dict=True,
                             )
                         else:

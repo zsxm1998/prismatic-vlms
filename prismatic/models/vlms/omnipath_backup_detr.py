@@ -26,7 +26,7 @@ from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import VisionBackbone
 from prismatic.models.projectors import FusedMLPProjector, LinearProjector, MLPProjector
 from prismatic.models.vlms.base_vlm import VLM
-from prismatic.models.backbones.accessory import BBoxEncoder, BBoxDecoder, ResNetEncoder, ResNet50Enc, MaskDecoderAllInOne
+from prismatic.models.backbones.accessory import BBoxEncoder, DETRDecoder, ResNetEncoder, ResNet50Enc, MaskDecoderAllInOne
 from prismatic.overwatch import initialize_overwatch
 from prismatic.util.bbox_ops import generalized_box_iou, restore_bboxes
 from prismatic.util.mask_ops import dice_loss, restore_masks
@@ -69,7 +69,7 @@ class OmniPathVLM(VLM):
         
         # Accessories for bbox and mask prediction
         self.bbox_encoder = BBoxEncoder(llm_backbone.embed_dim)
-        self.bbox_decoder = BBoxDecoder(llm_backbone.embed_dim)
+        self.bbox_decoder = DETRDecoder(llm_backbone.embed_dim, vision_backbone.embed_dim)
         self.mask_encoder = ResNet50Enc(embed_dim=llm_backbone.embed_dim)
         self.mask_decoder = MaskDecoderAllInOne(llm_backbone.embed_dim, vision_backbone.embed_dim, 
                                                 vision_backbone.num_patches, vision_backbone.default_image_size)
@@ -177,7 +177,7 @@ class OmniPathVLM(VLM):
             overwatch.info(f"[Frozen]    🥶 =>> LLM Backbone `{self.llm_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> Projector `{self.arch_specifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxEncoder", ctx_level=1)
-            overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxDecoder", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> DETRDecoder", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> MaskEncoder", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> MaskDecoder", ctx_level=1)
 
@@ -201,7 +201,7 @@ class OmniPathVLM(VLM):
             overwatch.info(f"[TRAINABLE] 🔥 =>> LLM Backbone `{self.llm_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> Projector `{self.arch_specifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxEncoder", ctx_level=1)
-            overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxDecoder", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> DETRDecoder", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> MaskEncoder", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> MaskDecoder", ctx_level=1)
 
@@ -225,7 +225,7 @@ class OmniPathVLM(VLM):
             overwatch.info(f"[Frozen]    🥶 =>> LLM Backbone `{self.llm_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> Projector `{self.arch_specifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxEncoder", ctx_level=1)
-            overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxDecoder", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> DETRDecoder", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> MaskEncoder", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> MaskDecoder", ctx_level=1)
 
@@ -250,7 +250,7 @@ class OmniPathVLM(VLM):
             overwatch.info(f"[TRAINABLE] 🔥 =>> LLM Backbone `{self.llm_backbone.identifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> Projector `{self.arch_specifier}`", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxEncoder", ctx_level=1)
-            overwatch.info(f"[TRAINABLE] 🔥 =>> BBoxDecoder", ctx_level=1)
+            overwatch.info(f"[TRAINABLE] 🔥 =>> DETRDecoder", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> MaskEncoder", ctx_level=1)
             overwatch.info(f"[TRAINABLE] 🔥 =>> MaskDecoder", ctx_level=1)
 
@@ -336,7 +336,7 @@ class OmniPathVLM(VLM):
         # Get Prismatic Wrapping Policy =>> just a module wrapping policy around `self.projector`
         prismatic_fsdp_wrapping_policy = partial(
             _module_wrap_policy,
-            module_classes={LinearProjector, MLPProjector, FusedMLPProjector, BBoxEncoder, BBoxDecoder, ResNetEncoder, MaskDecoderAllInOne},
+            module_classes={LinearProjector, MLPProjector, FusedMLPProjector, BBoxEncoder, DETRDecoder, ResNetEncoder, MaskDecoderAllInOne},
         )
 
         # Return union (_or_) over constituent policies
@@ -381,10 +381,14 @@ class OmniPathVLM(VLM):
 
         # Handle Inference (leverage cache, short-circuit on just LLM forward)
         if input_ids.shape[1] == 1 and past_key_values is not None:
-            # We're leveraging the cache, so just redirect to `self.llm_backbone` with `input_ids` and `past_key_values`
             replace_indices = torch.isin(input_ids, torch.tensor([self.config.bbox_id]).to(input_ids)).flatten()
             if replace_indices.sum() > 0: # replace the embeddings of <bbox> to previous generated output embeddings
-                inputs_embeds[replace_indices, -1] = self.bbox_encoder(self.bbox_decoder(previous_last_hidden_states[replace_indices, -1]))
+                if isinstance(pixel_values, dict):
+                    patch_features = self.vision_backbone({k: pixel_values[k][replace_indices] for k in pixel_values})
+                else:
+                    patch_features = self.vision_backbone(pixel_values[replace_indices])
+                inputs_embeds[replace_indices, -1] = self.bbox_encoder(self.bbox_decoder(previous_last_hidden_states[replace_indices, -1], patch_features))
+            
             replace_indices = torch.isin(input_ids, torch.tensor([self.config.mask_id]).to(input_ids)).flatten()
             if replace_indices.sum() > 0: # replace the embeddings of <mask> to previous generated output embeddings
                 if isinstance(pixel_values, dict):
@@ -392,6 +396,8 @@ class OmniPathVLM(VLM):
                 else:
                     patch_features = self.vision_backbone(pixel_values[replace_indices])
                 inputs_embeds[replace_indices, -1] = self.mask_encoder(self.mask_decoder(previous_last_hidden_states[replace_indices, -1:], patch_features))
+            
+            # We're leveraging the cache, so just redirect to `self.llm_backbone` with `input_ids` and `past_key_values`
             output = self.llm_backbone(
                 input_ids=None,
                 attention_mask=None,
@@ -619,15 +625,12 @@ class OmniPathVLM(VLM):
 
             # bbox prediction loss
             bbox_hs = shift_last_hidden_states[shift_labels == self.config.bbox_id]
-            bbox_preds = self.bbox_decoder(bbox_hs if bbox_valid_flag else bbox_embeds)
+            bbox_preds = self.bbox_decoder(bbox_hs if bbox_valid_flag else bbox_embeds,
+                                           patch_features.repeat_interleave(bbox_numbers, 0) if bbox_valid_flag
+                                           else torch.zeros(1,self.vision_backbone.num_patches,self.vision_backbone.embed_dim).to(inputs_embeds))
             loss += self.bbox_loss(bbox_preds, bboxes) * (1 if bbox_valid_flag else 0) # bbox是生成的则不参与loss计算
-
-            # bbox cycle loss
-            # bbox->embed->bbox
-            loss += 0.5 * self.bbox_loss(self.bbox_decoder(bbox_embeds), bboxes)
             # embed->bbox->embed
-            #loss += 0.5 * F.mse_loss(bbox_embeds, bbox_hs.detach() if bbox_valid_flag else bbox_embeds.detach())
-            loss += 0.5 * F.mse_loss(self.bbox_encoder(bbox_preds), bbox_hs if bbox_valid_flag else bbox_embeds)
+            loss += 0.5 * F.mse_loss(bbox_embeds, bbox_hs.detach() if bbox_valid_flag else bbox_embeds.detach())
 
             # mask prediction loss
             mask_hs = shift_last_hidden_states[shift_labels == self.config.mask_id].unsqueeze(1) # [number of <mask>, 1, D]

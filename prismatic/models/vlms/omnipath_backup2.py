@@ -638,7 +638,8 @@ class OmniPathVLM(VLM):
                 "past_key_values": past_key_values,
                 "use_cache": use_cache,
                 "bboxes": kwargs.get('bboxes', None), 
-                "previous_last_hidden_states": kwargs.get('previous_last_hidden_states', None), 
+                "previous_last_hidden_states": kwargs.get('previous_last_hidden_states', None),
+                "replace_indices": kwargs.get('replace_indices', None),
             }
         )
 

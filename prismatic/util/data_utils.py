@@ -31,6 +31,7 @@ class PaddedCollatorForLanguageModeling:
         pixel_values = [instance["pixel_values"] for instance in instances]
         if self.model_family in ['OmniPath']:
             bboxes = [instance["bboxes"] for instance in instances]
+            masks = [instance["masks"] for instance in instances]
 
         # For now, we only support Tokenizers with `padding_side = "right"` during Training (but plan to extend!)
         #   => Handle padding via RNN Utils => `pad_sequence`
@@ -80,7 +81,8 @@ class PaddedCollatorForLanguageModeling:
                 attention_mask=attention_mask,
                 labels=labels,
                 multimodal_indices=multimodal_indices,
-                bboxes=bboxes
+                bboxes=bboxes,
+                masks=masks,
             )
 
         return dict(

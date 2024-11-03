@@ -5,7 +5,7 @@ import torch
 from torchvision.ops.boxes import box_area
 import re
 
-from prismatic.constants import DEFAULT_BBOX_TOKEN, DEFAULT_BBOX_END_TOKEN
+from prismatic.constants import DEFAULT_BBOX_TOKEN
 
 
 def box_cxcywh_to_xyxy(x):
@@ -90,7 +90,7 @@ def masks_to_boxes(masks):
     return torch.stack([x_min, y_min, x_max, y_max], 1)
 
 
-def extract_and_replace_bboxes(input_str, bbox_tag="bbox", replace_with=DEFAULT_BBOX_TOKEN+DEFAULT_BBOX_END_TOKEN):
+def extract_and_replace_bboxes(input_str, bbox_tag="bbox", replace_with=DEFAULT_BBOX_TOKEN):
     # 定义正则表达式，匹配指定标签的bounding box
     pattern = re.compile(rf"<{bbox_tag}>(.*?)</{bbox_tag}>")
     
@@ -106,7 +106,7 @@ def extract_and_replace_bboxes(input_str, bbox_tag="bbox", replace_with=DEFAULT_
     return output_str, bboxes
 
 
-def restore_bboxes(output_str, bboxes, bbox_tag="bbox", replace_with=DEFAULT_BBOX_TOKEN+DEFAULT_BBOX_END_TOKEN):
+def restore_bboxes(output_str, bboxes, bbox_tag="bbox", replace_with=DEFAULT_BBOX_TOKEN):
     # 将tensor转换为字符串列表
     bbox_strs = [", ".join(map(lambda x: f"{x:.3f}", bbox.tolist())) for bbox in bboxes]
     # 用于替换的正则表达式

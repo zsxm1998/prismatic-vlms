@@ -446,9 +446,9 @@ def main(img_dir_format, q_file_format, a_file_format, vis_dir_format, img_size,
         evaluate_img_cls(image_info, category)
 
         # 计算patch分类的Accuracy和IoU
-        iou, true_list, pred_list = evaluate_patch_cls(image_info, patch_len)
-        print(f'{category} patch IoU: {iou:.4f}', ', classification_report:', sep='')
-        print(metrics.classification_report(true_list, pred_list, digits=4, zero_division=0))
+        # iou, true_list, pred_list = evaluate_patch_cls(image_info, patch_len)
+        # print(f'{category} patch IoU: {iou:.4f}', ', classification_report:', sep='')
+        # print(metrics.classification_report(true_list, pred_list, digits=4, zero_division=0))
 
         # 评测bbox的性能
         dec_res = evaluate_detection(image_info)

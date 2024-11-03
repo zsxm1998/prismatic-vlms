@@ -27,6 +27,10 @@ DINOSigLIP_VISION_BACKBONES = {
         "dino": "vit_large_patch14_reg4_dinov2.lvd142m",
         "siglip": "vit_so400m_patch14_siglip_384",
     },
+    "unisiglip-vit-so-384px": {
+        "dino": "hf-hub:MahmoodLab/uni",
+        "siglip": "vit_so400m_patch14_siglip_384",
+    },
 }
 
 
@@ -47,9 +51,14 @@ class DinoSigLIPViTBackbone(VisionBackbone):
         self.siglip_timm_path_or_url = DINOSigLIP_VISION_BACKBONES[vision_backbone_id]["siglip"]
 
         # Initialize both Featurizers (ViTs) by downloading from HF / TIMM Hub if necessary
-        self.dino_featurizer: VisionTransformer = timm.create_model(
-            self.dino_timm_path_or_url, pretrained=True, num_classes=0, img_size=self.default_image_size
-        )
+        if 'MahmoodLab/uni' in self.dino_timm_path_or_url:
+            self.dino_featurizer: VisionTransformer = timm.create_model(
+                self.dino_timm_path_or_url, pretrained=True, num_classes=0, img_size=self.default_image_size//14*16, init_values=1e-5,
+            )
+        else:
+            self.dino_featurizer: VisionTransformer = timm.create_model(
+                self.dino_timm_path_or_url, pretrained=True, num_classes=0, img_size=self.default_image_size
+            )
         self.dino_featurizer.eval()
 
         self.siglip_featurizer: VisionTransformer = timm.create_model(
@@ -69,7 +78,10 @@ class DinoSigLIPViTBackbone(VisionBackbone):
 
         # Get Configs for _both_ Featurizers =>> Note :: Override default image size for larger resolution models
         self.dino_data_cfg = timm.data.resolve_model_data_config(self.dino_featurizer)
-        self.dino_data_cfg["input_size"] = (3, self.default_image_size, self.default_image_size)
+        if 'MahmoodLab/uni' in self.dino_timm_path_or_url:
+            self.dino_data_cfg["input_size"] = (3, self.default_image_size//14*16, self.default_image_size//14*16)
+        else:
+            self.dino_data_cfg["input_size"] = (3, self.default_image_size, self.default_image_size)
 
         self.siglip_data_cfg = timm.data.resolve_model_data_config(self.siglip_featurizer)
         self.siglip_data_cfg["input_size"] = (3, self.default_image_size, self.default_image_size)
@@ -156,7 +168,8 @@ class DinoSigLIPViTBackbone(VisionBackbone):
 
     @property
     def num_patches(self) -> int:
-        assert self.dino_featurizer.patch_embed.num_patches == self.siglip_featurizer.patch_embed.num_patches
+        assert self.dino_featurizer.patch_embed.num_patches == self.siglip_featurizer.patch_embed.num_patches, \
+            f'{self.dino_featurizer.patch_embed.num_patches=}, {self.siglip_featurizer.patch_embed.num_patches=}'
         return self.dino_featurizer.patch_embed.num_patches
 
     @property
